@@ -2,8 +2,9 @@
 API Investigation Script
 ========================
 Systematically probes the Elyos interview APIs to discover undocumented behaviors.
+Findings are documented in docs/api-quirks-report.md with quirk IDs (G1, W1, R1, etc).
 
-Usage: python investigate.py [--weather] [--research] [--general] [--deep] [--all]
+Usage: python investigate_api_quirks.py [--weather] [--research] [--general] [--deep] [--all]
 """
 
 import asyncio
@@ -31,7 +32,8 @@ async def req(
     headers: dict | None = None,
     label: str = "",
 ):
-    """Fire a request and return a structured result dict."""
+    """Fire a request and return a structured result dict. Captures everything we might
+    need for analysis: status, headers, body, timing, and parsed JSON if available."""
     url = f"{BASE_URL}{path}"
     hdrs = {"X-API-Key": API_KEY}
     if headers:
@@ -131,7 +133,7 @@ async def test_weather(session: aiohttp.ClientSession):
         r = await req(session, method, path, params, headers, label)
         print_result(r)
 
-    # Auth tests (no key / wrong key)
+    # Auth tests need a separate session without the default API key
     async with aiohttp.ClientSession() as raw:
         r = await req(raw, "GET", "/weather", {"location": "London"},
                        {"X-API-Key": ""}, "empty API key")
@@ -149,7 +151,9 @@ async def test_weather(session: aiohttp.ClientSession):
             print(f"\n  [no API key header] HTTP {resp.status} in {round(time.perf_counter()-t0,3)}s")
             print(f"    Body: {body[:300]}")
 
-    # Repeated rapid requests — check for variance or rate limiting
+    # Rapid-fire same city: this is how we discovered W1 (schema variance), W3 (rate limiting),
+    # and W5 (live data). If all 5 responses are identical, it's cached; if they differ, we
+    # need to figure out what's changing (schema? temperature? throttle response?)
     print("\n  --- Rapid repeat test (London x5) ---")
     results = []
     for i in range(5):
@@ -157,7 +161,6 @@ async def test_weather(session: aiohttp.ClientSession):
         results.append(r)
         print_result(r)
 
-    # Check if responses are identical
     bodies = [r.get("body") for r in results]
     if len(set(bodies)) == 1:
         print("    >> All 5 responses identical")
@@ -205,13 +208,15 @@ async def test_research(session: aiohttp.ClientSession):
         r = await req(session, method, path, params, headers, label)
         print_result(r)
 
-    # Repeated same topic — check for caching or response variance
+    # Same topic repeated: discovered R2 (stale cache) this way — some responses come back
+    # with cached:true and a generated_at from ~310 days ago, randomly
     print("\n  --- Repeat same topic x3 (solar energy) ---")
     for i in range(3):
         r = await req(session, "GET", "/research", {"topic": "solar energy"}, None, f"repeat #{i+1}")
         print_result(r)
 
-    # Concurrent requests
+    # Concurrent requests: if total time ≈ single request time, the server handles parallel well.
+    # If total ≈ 3x single, it serializes. This informs whether parallel tool execution is worth it.
     print("\n  --- Concurrent requests (3 different topics) ---")
     t0 = time.perf_counter()
     tasks = [
@@ -227,7 +232,8 @@ async def test_research(session: aiohttp.ClientSession):
 
 
 async def req_with_retry(session, method, path, params, headers, label, max_retries=3):
-    """Make a request, automatically retrying on throttle responses."""
+    """Retry-aware wrapper for deep-dive tests. Without this, hitting a throttle mid-batch
+    would pollute results — we'd be measuring rate limit behavior instead of the quirk we're after."""
     for attempt in range(max_retries):
         r = await req(session, method, path, params, headers, label)
         if r.get("json") and r["json"].get("status") == "throttled":
@@ -254,6 +260,10 @@ async def test_deep(session: aiohttp.ClientSession):
     print("=" * 60)
     print("  Testing diverse cities with rate-limit-aware retries...\n")
 
+    # Diverse city selection to test multiple axes: does schema depend on region? city size?
+    # character encoding? name ambiguity? This is how we confirmed W1 is truly random per
+    # request (not per city/region) and discovered the W2 blocklist (Antarctica always 504s
+    # but North Pole and Atlantis work fine — it's not "fictional" or "extreme" locations).
     cities = [
         # Major world cities
         "London", "Tokyo", "Paris", "Berlin", "Moscow",
@@ -271,12 +281,13 @@ async def test_deep(session: aiohttp.ClientSession):
         "Antarctica", "North Pole",
     ]
 
+    # Group responses by their JSON keys to identify distinct schemas.
+    # This revealed exactly two: flat (4 keys) and multi-condition (3 keys with "conditions" array).
     schemas_seen = {}
     for city in cities:
         r = await req_with_retry(session, "GET", "/weather", {"location": city}, None, f"deep: {city}")
         print_result(r)
 
-        # Categorize schema
         j = r.get("json", {})
         if j:
             keys = sorted(j.keys())
@@ -302,6 +313,8 @@ async def test_deep(session: aiohttp.ClientSession):
         "artificial general intelligence",
     ]
 
+    # Flag the two research quirks (R1: empty body, R2: stale cache) as they appear.
+    # Running multiple topics confirms these are random per request, not topic-specific.
     for topic in topics:
         r = await req_with_retry(session, "GET", "/research", {"topic": topic}, None, f"deep: {topic}")
         print_result(r)
@@ -319,7 +332,10 @@ async def test_deep(session: aiohttp.ClientSession):
     print("DEEP-DIVE: RATE LIMIT RECOVERY")
     print("=" * 60)
 
-    # Hit the rate limit deliberately
+    # Deliberately trigger the rate limit, then test if retry_after_seconds is accurate.
+    # This is how we discovered W4: waiting the exact value still leaves you throttled ~80%
+    # of the time. A separate script (test_retry_after.py, not committed) confirmed this
+    # across 5 cycles and found that a +2s buffer always works.
     print("  Hitting weather rate limit deliberately...")
     for i in range(10):
         r = await req(session, "GET", "/weather", {"location": "London"}, None, f"ratelimit #{i+1}")
@@ -353,10 +369,12 @@ async def test_general(session: aiohttp.ClientSession):
     print("GENERAL / CROSS-CUTTING TESTS")
     print("=" * 60)
 
+    # Probe the server surface: what endpoints exist, what methods are allowed,
+    # does content negotiation work? This found G2 (GET-only) and G3 (ignores Accept header).
     tests = [
         ("GET", "/", None, None, "root endpoint"),
         ("GET", "/health", None, None, "health check"),
-        ("GET", "/healthz", None, None, "healthz"),
+        ("GET", "/healthz", None, None, "healthz"),  # common in GCP deployments
         ("GET", "/unknown", None, None, "unknown endpoint"),
         ("OPTIONS", "/weather", {"location": "London"}, None, "OPTIONS /weather"),
         ("HEAD", "/weather", {"location": "London"}, None, "HEAD /weather"),

@@ -56,8 +56,8 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 
 
 async def call_api(session: aiohttp.ClientSession, endpoint: str, params: dict) -> dict:
-    """Call the Elyos API. Handles: throttle-as-200 (G1), 504 (W2), retry+buffer (W3/W4),
-    empty body (R1), slow response timeout (R3)."""
+    """Single entry point for all API calls. Both endpoints share the same quirks (throttle-as-200,
+    timeouts, empty bodies), so handling them in one place avoids duplication and ensures consistency."""
     url = f"{BASE_URL}/{endpoint}"
     headers = {"X-API-Key": API_KEY or ""}  # or "": main() guards None; satisfies type checker
 
@@ -66,9 +66,10 @@ async def call_api(session: aiohttp.ClientSession, endpoint: str, params: dict) 
             # R3: research endpoint sometimes takes ~15s (documented as 3-8s), need generous timeout
             async with session.get(url, params=params, headers=headers,
                                    timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                # W2: valid locations randomly 504 (~20-25%), some always 504 (e.g. Antarctica, Mordor)
+                # W2: ~20-25% of requests randomly 504; some locations (Antarctica, Mordor) always 504.
+                # No retry on 504: the server already spent ~10s before giving up, so retrying
+                # would mean ~30s of waiting for blocklisted locations that will never succeed.
                 if resp.status == 504:
-                    # No retry: API already spent ~10s before returning 504
                     try:
                         body = await resp.json()
                         detail = body.get("error", "no detail")
@@ -97,9 +98,12 @@ async def call_api(session: aiohttp.ClientSession, endpoint: str, params: dict) 
                 if not isinstance(body, dict):
                     return {"error": f"API returned unexpected format ({body})"}
 
-                # G1: rate limits come back as HTTP 200 (not 429!), only detectable in the body
+                # G1: the most dangerous quirk — rate limits come back as HTTP 200 (not 429!).
+                # Without this check, throttle payloads get silently passed to the LLM as data.
                 if body.get("status") == "throttled":
-                    wait = body.get("retry_after_seconds", 5) + 2  # W4: retry_after lies, still throttled after waiting exact value
+                    # W4: +2s buffer because retry_after undershoots (tested: still throttled 4/5 times
+                    # after waiting the exact value, but always recovers with a small buffer)
+                    wait = body.get("retry_after_seconds", 5) + 2
                     if attempt < MAX_RETRIES - 1:
                         await asyncio.sleep(wait)
                         continue
@@ -123,7 +127,9 @@ async def call_api(session: aiohttp.ClientSession, endpoint: str, params: dict) 
 
 
 def normalize_weather(data: dict) -> str:
-    """W1: API returns two different JSON schemas for the same city, randomly per request."""
+    """W1: API randomly returns two schemas — flat {temperature_c, condition, humidity} or
+    multi-condition {conditions: [{...}, ...]}. Tested 20 cities x 5 rounds: schema is random
+    per request, not per city. Both must be handled on every call."""
     if "error" in data:
         return f"Error: {data['error']}"
     location = data.get("location", "Unknown")
@@ -149,7 +155,8 @@ def normalize_weather(data: dict) -> str:
 
 
 def format_research(data: dict) -> str:
-    """R2: ~10-15% of responses are randomly stale (~310 days old), must flag for the LLM."""
+    """R2: ~10-15% of responses are randomly stale (~310 days old). We surface the staleness
+    info to the LLM so it can caveat its answer rather than presenting old data as current."""
     if "error" in data:
         return f"Error: {data['error']}"
     if not data.get("summary"):
@@ -189,7 +196,8 @@ async def execute_tool(session: aiohttp.ClientSession, name: str, input_data: di
 
 
 async def spinner(message: str, done: asyncio.Event) -> None:
-    """Animated spinner. Shows checkmark on completion, clears on cancellation."""
+    """Animated spinner. Uses an asyncio.Event to distinguish normal completion from user
+    cancellation — checkmark on success, silent clear on cancel (no misleading 'done' message)."""
     i = 0
     try:
         while True:
@@ -197,9 +205,9 @@ async def spinner(message: str, done: asyncio.Event) -> None:
             await asyncio.sleep(0.1)
             i += 1
     except asyncio.CancelledError:
-        if done.is_set():
+        if done.is_set():  # tool call completed successfully before spinner was cancelled
             print(f"\r✓ {message} - done", flush=True)
-        else:
+        else:  # user cancelled — clear the spinner line silently
             print(f"\r{' ' * (len(message) + 4)}\r", end="", flush=True)
 
 
@@ -208,8 +216,11 @@ async def stream_response(
     session: aiohttp.ClientSession,
     messages: list,
 ) -> None:
-    """Stream Claude's response, executing tools in a loop until end_turn."""
+    """Core agentic loop: stream Claude's response, execute any requested tools, feed results
+    back, and repeat until Claude says end_turn. The while loop is what makes this agentic —
+    Claude can chain multiple tool calls across turns before giving a final answer."""
     while True:
+        # Track partial text so we can save it to history if the user cancels mid-stream
         partial_text = ""
         try:
             async with client.messages.stream(
@@ -221,9 +232,11 @@ async def stream_response(
                     print(text, end="", flush=True)
                 response = await stream.get_final_message()
         except asyncio.CancelledError:
+            # Preserve whatever Claude already said so conversation history stays coherent
             if partial_text.strip():
                 messages.append({"role": "assistant", "content": partial_text})
             raise
+        # Anthropic SDK errors: pop the user message so they can retry without a dangling message
         except anthropic.AuthenticationError:
             print("\nError: Invalid ANTHROPIC_API_KEY. Check your .env file.")
             messages.pop()
@@ -241,7 +254,8 @@ async def stream_response(
             messages.pop()
             return
 
-        # Always append - includes both text and tool_use blocks
+        # Append the full response (text + tool_use blocks) before checking for tools.
+        # This keeps history valid regardless of what happens during tool execution.
         messages.append({"role": "assistant", "content": response.content})
 
         tool_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -249,8 +263,10 @@ async def stream_response(
             print()
             return
 
-        # Every tool_use must have a matching tool_result or the API rejects the next request.
-        # If the user cancels mid-batch, remaining tools get "Cancelled by user." results.
+        # Anthropic API requires every tool_use to have a matching tool_result — missing pairs
+        # cause a 400 on the next request. So even on cancellation, we fill in all results.
+        # Tools run sequentially (not parallel) — simpler cancellation, and the APIs rate-limit
+        # aggressively anyway so parallel wouldn't help much.
         tool_results = []
         cancelled = False
         for tool in tool_blocks:
@@ -281,11 +297,13 @@ async def stream_response(
         messages.append({"role": "user", "content": tool_results})
         if cancelled:
             raise asyncio.CancelledError()
+        # Loop continues: Claude will see the tool results and either respond or request more tools
 
 
 
 async def async_input(prompt: str) -> str:
-    """Run input() in a thread so the event loop can still receive SIGINT."""
+    """Run blocking input() in a thread pool. This keeps the event loop free to process
+    our SIGINT handler — if input() ran on the main thread, signals would be blocked."""
     return await asyncio.get_running_loop().run_in_executor(None, lambda: input(prompt))
 
 
@@ -297,6 +315,8 @@ async def main():
         print("Error: ANTHROPIC_API_KEY not set in .env")
         sys.exit(1)
 
+    # Persistent client and session for the whole app — no per-turn recreation,
+    # connection pooling works across turns for both aiohttp and httpx
     client = anthropic.AsyncAnthropic()
     messages: list[dict] = []
     current_task: asyncio.Task | None = None
@@ -305,8 +325,11 @@ async def main():
     loop = asyncio.get_running_loop()
 
     def on_sigint():
-        # task.cancel() instead of KeyboardInterrupt: asyncio can't deliver
-        # KeyboardInterrupt to a running coroutine (see docs/async-repl-and-ctrl-c.md)
+        # We use task.cancel() instead of letting KeyboardInterrupt propagate because
+        # asyncio can't reliably deliver KeyboardInterrupt to a running coroutine.
+        # CancelledError is the cooperative cancellation mechanism asyncio understands
+        # natively — it propagates through the await chain and triggers context manager
+        # cleanup (closing HTTP connections, etc). See docs/async-repl-and-ctrl-c.md
         nonlocal current_task, sigint_count
         if current_task and not current_task.done():
             current_task.cancel()
@@ -315,7 +338,9 @@ async def main():
             sigint_count += 1
             if sigint_count >= 2:
                 print("\nGoodbye!")
-                os._exit(0)  # input() thread blocks clean shutdown
+                # os._exit because the input() thread can't be interrupted cooperatively —
+                # it blocks in C code. A library like prompt_toolkit would fix this.
+                os._exit(0)
             else:
                 print("\n(Press Ctrl+C again to exit)")
                 print("\nYou: ", end="", flush=True)
@@ -353,6 +378,7 @@ async def main():
                 messages.append({"role": "user", "content": user_input})
                 print("\nAssistant: ", end="", flush=True)
 
+                # Wrap in a task so on_sigint can call .cancel() on it
                 current_task = asyncio.create_task(stream_response(client, session, messages))
                 try:
                     await current_task
